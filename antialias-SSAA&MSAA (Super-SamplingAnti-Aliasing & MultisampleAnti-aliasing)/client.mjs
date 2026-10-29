@@ -1,5 +1,5 @@
-// mods/lyric-antialias/client.mjs
-// 歌词画布抗锯齿（Lyric Anti-Aliasing）· Folium 1.7
+// client.mjs —— 超采样与多重采样抗锯齿（Folium 1.7 模组入口）
+// 改 window.devicePixelRatio 让歌词画布按 2 倍光栅化，再给 WebGL 上下文补 MSAA。
 //
 // 症状：monet / lattice / hanabi / lumiere / fume / cadenza / pendolo 这些把歌词画在 canvas
 // 或 WebGL 纹理上的歌词动画，字在缩放、扫光、发光、模糊时边缘有台阶和抖动；classic /
@@ -33,21 +33,33 @@
 // 窗口；与 MSAA 同开时上限收到 2 倍后约 830 万像素（1920×1080 @2x）——乘上 4 个采样后，
 // 总采样量正好与「4K 单独超采样」持平。
 //
-// 副作用与保护：dpr 是全窗口共用的，所以画布跟着变大的不只是歌词；视频导出会按 dpr 把窗口
-// 缩到「预设像素 / dpr」大小，导出的画面会只剩四分之一。宿主在导出开头会插一个
-// `<style data-folia-video-export-cursor-guard>`（electronVideoExport.ts），这里在 appendChild
-// 时同步看到它就暂停超采样，导出结束后自动恢复 —— 同步很重要：`prepareVideoExportWindow` 读
-// dpr 和插 style 在同一个任务里，MutationObserver 已经来不及。
+// 动了哪些全局接口（以及为什么躲不开）：
+//   window.devicePixelRatio          垫到 2。宿主各渲染器都从这里取像素密度，模组拿不到 renderer.resolution。
+//   window.matchMedia('(resolution:)') 只改「等于虚拟倍率」的那类查询，改成 max-resolution，其余原样转发。
+//   HTMLCanvasElement.prototype.getContext  webgl/webgl2 补 antialias；2d 只给大画布补高插值质量。
+// dpr 是全窗口共用的，所以变的不只是歌词画布：封面、设置页预览、其它模组的画布都会跟着变。
+// 因此默认全部关着，由用户自己开；开了也只建议在有歌词画布的页面用。
+//
+// 视频导出：宿主在导出开头会插一个 `<style data-folia-video-export-cursor-guard>`，导出的取景
+// 按 dpr 算，超采样会让画面只剩四分之一。这个判断放在 dpr 的 getter 里同步做（读一次 DOM），
+// 因为 `prepareVideoExportWindow` 读 dpr 和插 style 在同一个任务里，异步观察已经来不及。
+// 它是宿主的实现细节：哪天换了标记，最坏情况只是导出画面被缩小，不影响其它功能。
 //
 // 自动重载渲染：宿主只在窗口 resize 与画布容器的 ResizeObserver 里重读 dpr（hanabi 的运行时
 // 就是 resizeToHost 里取 `window.devicePixelRatio`），所以光改 dpr 不会让已建好的画布重建。
-// 设置一改（或点「重新应用」），这里把画布容器抖 1px 再还原 —— ResizeObserver 回调两次，
-// 运行时当场 renderer.resize 并按新倍率重建场景纹理，不用再切一次歌词动画。
+// 设置一改（或点「重新应用」），这里把覆盖视口的大画布容器抖 1px 再还原 —— ResizeObserver
+// 回调两次，运行时当场 renderer.resize 并按新倍率重建场景纹理。
 // MSAA 的 antialias 是建上下文时的属性，画布重建也改不了：只能等下一次重建 WebGL 上下文
 // （切歌词动画 / 重启）才跟上，日志与命令提示里写明了这一点。
 
-/** @typedef {import('../folium').FoliumClientApi} Folium */
-/** @typedef {import('../folium').FoliumSettingAccess} SettingAccess */
+/**
+ * 本模组用到的宿主 API（结构类型，不依赖宿主仓库里的类型文件）：
+ * - `env.context`：client / main / export 窗口之一，只有 `main` 里才有歌词画布。
+ * - `registries.settingsSections.register(section)` → `{ settings: { get(), onChange(cb) } }`
+ * - `registries.commands.register(command)`
+ * - `log.info` / `log.warn`
+ * @typedef {object} FoliumHost
+ */
 
 /** 超采样倍率：与应用内各渲染器的分辨率上限一致。 */
 const SUPERSAMPLE_RATIO = 2;
@@ -63,19 +75,19 @@ const SUPERSAMPLE_PIXEL_BUDGET = 3840 * 2160 * 4;
  */
 const COMBINED_PIXEL_BUDGET = 1920 * 1080 * 4;
 /** 同一个模组被重复加载时先收掉上一份补丁，避免两层 dpr 覆盖叠在一起。 */
-const INSTANCE_KEY = Symbol.for('folia.mod.lyric-antialias');
+const INSTANCE_KEY = Symbol.for('folia.mod.antialias-ssaa-msaa');
 /** 与 mod.json 的 version 保持一致：启用时打进日志，一眼能看出加载的是哪份构建。 */
-const MOD_VERSION = '1.1.6';
-/** 宿主视频导出期间插在 head 里的光标守卫，用来判断导出开始 / 结束。 */
+const MOD_VERSION = '1.1.7';
+/** 宿主视频导出期间插在 head 里的光标守卫（宿主实现细节，换了标记只是导出保护失效）。 */
 const EXPORT_GUARD_SELECTOR = 'style[data-folia-video-export-cursor-guard]';
-/** 导出结束时恢复的轮询周期。只在暂停期间有意义。 */
-const RESUME_POLL_MS = 500;
 /** 设置变更后等多久再重建渲染：连点几个开关时只重建一次。 */
 const RELOAD_DEBOUNCE_MS = 250;
+/** 2D 高插值只给这么大的画布用：封面色取样、图标那类小画布用不上，也不该被改行为。 */
+const SMOOTH2D_MIN_PX = 64;
 /** 记住多少个 MediaQueryList：React 的 dpr 订阅每换一次倍率会新建一个。 */
 const TRACKED_MEDIA_QUERIES = 256;
 
-/** @param {Folium} folium */
+/** @param {FoliumHost} folium */
 export default function activate(folium) {
     // 导出窗口里的画面尺寸由窗口本身决定，垫高 dpr 只会改变导出的取景，所以什么都不做。
     if (folium.env && folium.env.context !== 'main') return undefined;
@@ -93,29 +105,29 @@ export default function activate(folium) {
 
     const section = folium.registries.settingsSections.register({
         id: 'antialias',
-        label: { 'zh-CN': '歌词抗锯齿', en: 'Lyric anti-aliasing' },
+        label: { 'zh-CN': '超采样与多重采样抗锯齿', en: 'Supersampling & MSAA' },
         description: {
-            'zh-CN': '减轻 canvas / WebGL 歌词画布上的锯齿。2× 超采样（默认，管字形与贴图）与 MSAA（只抗几何边）可以同时开；叠加时像素预算更紧，超预算会自动先收超采样。',
-            en: 'Softens stairsteps on canvas / WebGL lyric layers. 2× supersampling (default, covers glyphs and textures) and MSAA (geometric edges only) can be on together; stacking uses a tighter pixel budget, and supersampling is the one dropped when it overflows.',
+            'zh-CN': '减轻 canvas / WebGL 歌词画布上的锯齿。两项默认都关着，按需开：2× 超采样管字形与贴图，MSAA 只抗几何边，可以同时开；叠加时像素预算更紧，超预算会自动先收超采样。',
+            en: 'Softens stairsteps on canvas / WebGL lyric layers. Both switches start off: 2× supersampling covers glyphs and textures, MSAA only geometric edges, and they can be on together. Stacking uses a tighter pixel budget, and supersampling is the one dropped when it overflows.',
         },
         settings: [
             {
                 key: 'supersample',
                 type: 'boolean',
-                label: { 'zh-CN': '2× 超采样（推荐）', en: '2× supersampling (recommended)' },
+                label: { 'zh-CN': '2× 超采样（4 倍帧缓冲，按需开）', en: '2× supersampling (4× framebuffer, opt-in)' },
                 description: {
-                    'zh-CN': '按 2 倍像素绘制歌词再降采样。100% / 125% 缩放的屏幕改善最明显；本来就 ≥2 倍的高分屏画面不变。代价是帧缓冲像素数变成 4 倍：单独开时窗口大于 4K 才自动跳过；与 MSAA 同开时预算收得更紧（2 倍后约 830 万像素），超了就先收这一项、只留 MSAA。',
-                    en: 'Draws lyrics at twice the pixels and lets the compositor downsample. Most visible on 100% / 125% displays. Quadruples the framebuffer pixels: alone it only steps aside above 4K, but stacked with MSAA the budget tightens (~8.3M doubled pixels) and this is the one dropped.',
+                    'zh-CN': '按 2 倍像素绘制歌词再降采样。100% / 125% 缩放的屏幕改善最明显；本来就 ≥2 倍的高分屏画面不变。代价是整窗帧缓冲像素数变成 4 倍，核显 / 低配机器可能掉帧，所以默认关闭。单独开时窗口大于 4K 才自动跳过；与 MSAA 同开时预算收得更紧（2 倍后约 830 万像素），超了就先收这一项、只留 MSAA。',
+                    en: 'Draws lyrics at twice the pixels and lets the compositor downsample. Most visible on 100% / 125% displays. Quadruples the framebuffer pixels for the whole window, which can cost frames on integrated graphics, so it is off by default. Alone it only steps aside above 4K; stacked with MSAA the budget tightens (~8.3M doubled pixels) and this is the one dropped.',
                 },
-                defaultValue: true,
+                defaultValue: false,
             },
             {
                 key: 'msaa',
                 type: 'boolean',
                 label: { 'zh-CN': '强制 MSAA（可与超采样同开）', en: 'Force MSAA (can stack with supersampling)' },
                 description: {
-                    'zh-CN': 'hanabi 等风格为了性能把 WebGL 的 antialias 关掉了，卡片、色块、装饰线的直边因此是硬台阶。打开后由 MSAA 直接给这些几何边着色。只抗几何边、不改善字形，所以和超采样互补，可以同时开：叠加是 16 倍帧缓冲，预算比单独超采样紧一档（2 倍后约 830 万像素），超了会先收超采样。改这一项需要重启 Folia 或切换一次歌词动画。',
-                    en: 'Styles such as hanabi switch WebGL antialias off for speed, leaving the straight edges of cards and blocks hard. MSAA covers those edges and, since it does nothing for glyphs, stacks with supersampling. Stacking is 16× the framebuffer, so the budget is one notch tighter (~8.3M doubled pixels); over that, supersampling is dropped first. Needs a restart or a lyric style switch.',
+                    'zh-CN': 'hanabi 等风格为了性能把 WebGL 的 antialias 关掉了，卡片、色块、装饰线的直边因此是硬台阶。打开后由 MSAA 直接给这些几何边着色。只抗几何边、不改善字形，所以和超采样互补，可以同时开：叠加是 16 倍帧缓冲，预算比单独超采样紧一档（2 倍后约 830 万像素），超了会先收超采样。注意它作用于本窗口内此后新建的每个 WebGL 上下文（不只歌词），所以默认关。改这一项要等下次重建上下文（切歌词动画 / 重启）才生效。',
+                    en: 'Styles such as hanabi switch WebGL antialias off for speed, leaving the straight edges of cards and blocks hard. MSAA covers those edges and, since it does nothing for glyphs, stacks with supersampling. Stacking is 16× the framebuffer, so the budget is one notch tighter (~8.3M doubled pixels); over that, supersampling is dropped first. It applies to every WebGL context created afterwards in this window, not only lyrics, so it starts off. Takes effect on the next context rebuild (style switch or restart).',
                 },
                 defaultValue: false,
             },
@@ -156,18 +168,18 @@ export default function activate(folium) {
 
     folium.registries.commands.register({
         id: 'reapply',
-        label: { 'zh-CN': '歌词抗锯齿：重新应用', en: 'Lyric anti-aliasing: re-apply' },
+        label: { 'zh-CN': '超采样与 MSAA：重新应用', en: 'Supersampling & MSAA: re-apply' },
         description: {
-            'zh-CN': '按当前设置重新应用，并让宿主按新的像素比重建歌词画布。运行中刚启用模组时，切换一次歌词动画即可看到效果。',
-            en: 'Applies the current settings again and asks the host to rebuild lyric canvases at the new pixel ratio. If the mod was just enabled, switch the lyric style once to see it.',
+            'zh-CN': '按当前设置重新应用，并就地让歌词画布按新的像素比重建（抖一次画布容器触发 ResizeObserver，再补一次 resize）。开关改了但画面没动时跑这条。',
+            en: 'Applies the current settings again and rebuilds the lyric canvases in place at the new pixel ratio (a 1px host nudge for ResizeObserver plus one resize). Run this when a switch changed but the picture did not.',
         },
-        keywords: ['antialias', 'anti-aliasing', 'ssaa', 'supersample', '锯齿', '抗锯齿'],
+        keywords: ['antialias', 'anti-aliasing', 'ssaa', 'supersample', 'msaa', '锯齿', '抗锯齿'],
         run: () => antialiasing.reapply(),
     });
 
     folium.registries.commands.register({
         id: 'status',
-        label: { 'zh-CN': '歌词抗锯齿：诊断', en: 'Lyric anti-aliasing: status' },
+        label: { 'zh-CN': '超采样与 MSAA：诊断', en: 'Supersampling & MSAA: status' },
         description: {
             'zh-CN': '报当前生效的像素比、各画布的后备像素比，以及 WebGL 上下文是否真的拿到了 MSAA。怀疑没生效时先跑这一条。',
             en: 'Reports the effective pixel ratio, each canvas\'s backing-store ratio and whether WebGL contexts really got MSAA. Run this first if you are unsure whether the mod is working.',
@@ -190,7 +202,7 @@ export default function activate(folium) {
         // 冷启动时画布还没建，重载是空转；热启用（运行中点开模组）时它正好把画布重建到新倍率。
         antialiasing.onSettingsChanged();
         // 打一条启用日志：日志里能直接看到版本和生效方式，也顺便证明模组确实被加载了。
-        folium.log.info(`歌词抗锯齿 v${MOD_VERSION} 已启用：${antialiasing.summary()}`);
+        folium.log.info(`超采样与 MSAA v${MOD_VERSION} 已启用：${antialiasing.summary()}`);
         antialiasing.nudgeRebuild();
     } catch (error) {
         folium.log.warn?.(`抗锯齿初始化失败，已自行收手：${describeError(error)}`);
@@ -218,15 +230,14 @@ function describeError(error) {
 
 /**
  * 全部补丁的安装、还原与状态。返回的 `dispose` 把 window 上的每一处改动都退回去。
- * @param {Folium} folium
- * @param {SettingAccess} settings
+ * @param {FoliumHost} folium
+ * @param {{ get: () => object, onChange: (cb: () => void) => () => void }} settings
  */
 function createAntiAliasing(folium, settings) {
     // 必须在定义自己的 devicePixelRatio 之前读出来，否则读到的就是自己的 getter。
     const readRealRatio = findRealRatioGetter();
     const ownRatioDescriptor = Object.getOwnPropertyDescriptor(window, 'devicePixelRatio');
     const nativeMatchMedia = window.matchMedia;
-    const nativeAppendChild = Node.prototype.appendChild;
     const nativeGetContext = HTMLCanvasElement.prototype.getContext;
 
     /** @type {MediaQueryList[]} */
@@ -243,9 +254,12 @@ function createAntiAliasing(folium, settings) {
     let contextsPatched = false;
     let smooth2dEnabled = false;
     let msaaEnabled = false;
-    let guardPatched = false;
-    let suspended = false;
-    let stopPolling = null;
+    /** 是否在导出期间自动让出（用户可关）。 */
+    let guardEnabled = true;
+    /** 观察 head 只用于日志与通知；真正的判断在 getter 里同步做。 */
+    let guardObserver = null;
+    /** 上一次看到的导出状态，用来只在切换时记一条日志。 */
+    let guardSeen = false;
     /** 上一次应用出去的 MSAA 状态；null 表示还没应用过（冷启动时不用提醒）。 */
     let appliedMsaa = null;
     /** 「应用设置后自动重载渲染」的合并计时器：连点几个开关只重建一次。 */
@@ -254,8 +268,10 @@ function createAntiAliasing(folium, settings) {
     const values = () => {
         const stored = settings.get() || {};
         return {
-            supersample: stored.supersample !== false,
-            msaa: stored.msaa !== false,
+            // 这两项默认关：超采样会把这个窗口的帧缓冲放大 4 倍，MSAA 会改本窗口所有 WebGL 上下文。
+            // 用 `=== true` 而不是 `!== false`：宿主没写过的键就是 undefined，必须按「关」处理。
+            supersample: stored.supersample === true,
+            msaa: stored.msaa === true,
             smooth2d: stored.smooth2d !== false,
             exportGuard: stored.exportGuard !== false,
             autoReload: stored.autoReload !== false,
@@ -281,10 +297,26 @@ function createAntiAliasing(folium, settings) {
         budgetOk = pixels <= 0 || pixels <= pixelBudget();
     };
 
-    /** 宿主看到的像素比：垫高过就是 max(真实, 2)，暂停、超预算或关闭时就是真实值。 */
+    /**
+     * 宿主是否正在准备视频导出。只看 head 里有没有那个光标守卫 —— 是宿主实现细节，
+     * 但它是唯一能在同步上下文里拿到的信号；读一次 DOM 很便宜（head 的子节点很少）。
+     */
+    const hasExportGuard = () => {
+        try {
+            // 只查 head：守卫插在 head 里，范围小到可以忽略不计。
+            return document.head.querySelector(EXPORT_GUARD_SELECTOR) !== null;
+        } catch {
+            return false;
+        }
+    };
+
+    /** 导出期间自动让出超采样：用户关掉这一项就完全不看导出的状态。 */
+    const exportPaused = () => guardEnabled && hasExportGuard();
+
+    /** 宿主看到的像素比：垫高过就是 max(真实, 2)，导出中、超预算或关闭时就是真实值。 */
     const currentRatio = () => {
         const real = readRealRatio();
-        if (!ratioOverridden || suspended || factor <= 1 || !budgetOk) return real;
+        if (!ratioOverridden || factor <= 1 || !budgetOk || exportPaused()) return real;
         return real > factor ? real : factor;
     };
 
@@ -312,7 +344,7 @@ function createAntiAliasing(folium, settings) {
      */
     const rewriteQuery = (query) => {
         const scale = factor;
-        if (!ratioOverridden || suspended || scale <= 1 || !/resolution/i.test(query)) return query;
+        if (!ratioOverridden || scale <= 1 || exportPaused() || !/resolution/i.test(query)) return query;
         return query.replace(
             /\(\s*resolution\s*:\s*([0-9.]+)\s*(dppx|dpi)\s*\)/gi,
             (match, value, unit) => {
@@ -385,14 +417,31 @@ function createAntiAliasing(folium, settings) {
 
     // ------------------------------------------------------------ 导出保护
 
-    /** @param {boolean} next */
-    const setSuspended = (next, reason) => {
-        if (suspended === next) return;
-        const before = currentRatio();
-        suspended = next;
-        if (before !== currentRatio()) scheduleRatioChange();
-        if (next) folium.log.info(`暂停超采样：${reason}`);
-        else folium.log.info('恢复超采样');
+    /**
+     * 导出状态本身由 `exportPaused()` 在 getter 里同步判断，这里只做两件事：
+     * 状态切换时通知订阅者（异步就行），以及在日志里留一句。
+     * 用 MutationObserver 观察 head，不包装 appendChild，也就不影响宿主插任何别的节点。
+     */
+    const watchExportGuard = () => {
+        if (guardObserver || !guardEnabled) return;
+        guardSeen = hasExportGuard();
+        guardObserver = new MutationObserver(() => {
+            const now = hasExportGuard();
+            if (now === guardSeen) return;
+            guardSeen = now;
+            folium.log.info(now ? '检测到视频导出：超采样暂时让出' : '导出结束：超采样恢复');
+            scheduleRatioChange();
+        });
+        guardObserver.observe(document.head, { childList: true, subtree: false });
+        undo.push(() => {
+            guardObserver?.disconnect();
+            guardObserver = null;
+        });
+    };
+
+    const unwatchExportGuard = () => {
+        guardObserver?.disconnect();
+        guardObserver = null;
     };
 
     /** 窗口尺寸变化后重算预算：窗口大到超预算时让出超采样，缩回来再恢复。 */
@@ -400,45 +449,6 @@ function createAntiAliasing(folium, settings) {
         const before = currentRatio();
         refreshPixelBudget();
         if (before !== currentRatio()) scheduleRatioChange();
-    };
-
-    const stopExport = () => {
-        if (!suspended) return;
-        setSuspended(false, '');
-    };
-
-    const startExport = () => {
-        if (!values().exportGuard) return;
-        setSuspended(true, '宿主正在为视频导出调整窗口大小');
-        if (stopPolling) return;
-        // 导出结束时光标守卫被 remove 掉；这里的轮询只在暂停期间做事。
-        stopPolling = folium.every(RESUME_POLL_MS, () => {
-            if (suspended && !document.querySelector(EXPORT_GUARD_SELECTOR)) stopExport();
-        });
-    };
-
-    const patchExportGuard = () => {
-        if (guardPatched) return;
-        guardPatched = true;
-        // 必须同步：导出流程先插 style，紧接着在同一个任务里读 dpr 交给主进程。
-        // 这是 React 每次提交都会走的热路径，所以先做最便宜的判断，再谈别的。
-        Node.prototype.appendChild = function appendChild(node) {
-            const appended = nativeAppendChild.call(this, node);
-            if (node && node.nodeType === 1 && node.tagName === 'STYLE'
-                && node.hasAttribute('data-folia-video-export-cursor-guard')) {
-                try {
-                    startExport();
-                } catch {
-                    // 判断失败不能影响宿主插节点。
-                }
-            }
-            return appended;
-        };
-        undo.push(() => {
-            Node.prototype.appendChild = nativeAppendChild;
-            stopPolling?.();
-            stopPolling = null;
-        });
     };
 
     // ------------------------------------------- 2D 插值质量 + WebGL 多重采样
@@ -469,6 +479,8 @@ function createAntiAliasing(folium, settings) {
             }
             const context = nativeGetContext.call(this, type, options);
             if (!context || type !== '2d' || !smooth2dEnabled || smoothedContexts.has(context)) return context;
+            // 小画布（封面色取样、图标、缩略图）不动：它们本来就不做缩放取样，改了只是白白多一层包装。
+            if (this.width < SMOOTH2D_MIN_PX || this.height < SMOOTH2D_MIN_PX) return context;
             smoothedContexts.add(context);
             const nativeDrawImage = context.drawImage;
             // canvas 的 width/height 一改，绘制状态就被重置（imageSmoothingQuality 回到 low），
@@ -552,20 +564,24 @@ function createAntiAliasing(folium, settings) {
      */
     const nudgeHosts = () => {
         if (typeof window.requestAnimationFrame !== 'function') return;
+        if (document.hidden) return;
+        const viewport = (Number(window.innerWidth) || 0) * (Number(window.innerHeight) || 0);
         /** @type {HTMLElement[]} */
         const hosts = [];
         for (const canvas of document.querySelectorAll('canvas')) {
             const box = canvas.getBoundingClientRect();
-            // 太小的画布（图集、图标、隐藏的预览）抖了也没意义，反而容易撞上宿主自己的布局。
+            // 只认覆盖视口一大块的画布（歌词舞台）：图集、封面取色、缩略图、别的模组的小画布都不碰。
             if (box.width < 64 || box.height < 64) continue;
+            if (viewport > 0 && box.width * box.height < viewport * 0.2) continue;
             const host = canvas.parentElement;
             if (!host || hosts.includes(host)) continue;
-            // 只认「容器就是这个画布」的那种父元素：整个舞台容器（含字幕、背景、其它层）不能抖，
-            // 抖一下会把别的层也带着位移。
+            if (host === document.body || host === document.documentElement) continue;
+            // 再退一步：只认「容器就是这个画布」的父元素，整个舞台容器（含字幕、背景、其它层）不抖，
+            // 免得把别的层也带着位移。
             const stage = host.getBoundingClientRect();
             if (Math.abs(stage.width - box.width) > 2 || Math.abs(stage.height - box.height) > 2) continue;
             hosts.push(host);
-            if (hosts.length >= 8) break;
+            if (hosts.length >= 4) break;
         }
         if (!hosts.length) return;
         const saved = hosts.map(host => ({
@@ -575,16 +591,24 @@ function createAntiAliasing(folium, settings) {
         }));
         window.requestAnimationFrame(() => {
             for (const { host } of saved) {
-                const box = host.getBoundingClientRect();
-                if (box.width < 2 || box.height < 2) continue;
-                host.style.width = `${Math.round(box.width) - 1}px`;
-                host.style.height = `${Math.round(box.height) - 1}px`;
+                try {
+                    const box = host.getBoundingClientRect();
+                    if (box.width < 2 || box.height < 2) continue;
+                    host.style.width = `${Math.round(box.width) - 1}px`;
+                    host.style.height = `${Math.round(box.height) - 1}px`;
+                } catch {
+                    // 元素在抖动之前被宿主移除了，跳过。
+                }
             }
             window.requestAnimationFrame(() => {
                 for (const { host, width, height } of saved) {
-                    // 还原成原来那行内联样式；宿主若中途重写过，退回 CSS 类布局也不会错。
-                    host.style.width = width;
-                    host.style.height = height;
+                    try {
+                        // 还原成原来那行内联样式；宿主若中途重写过，退回 CSS 类布局也不会错。
+                        host.style.width = width;
+                        host.style.height = height;
+                    } catch {
+                        // 同上：节点已经没了就不用还原。
+                    }
                 }
                 // 还原之后再补一次真 resize：量窗口的那类 2D 画布认这个。
                 nudgeRebuild();
@@ -616,7 +640,7 @@ function createAntiAliasing(folium, settings) {
 
     /** 一行摘要，给启动日志和「诊断」共用。 */
     const summary = () => {
-        const suffix = suspended ? '（导出中已暂停）' : '';
+        const suffix = exportPaused() ? '（导出中已暂停）' : '';
         return `${modeLabel()}${suffix}，dpr ${readRealRatio().toFixed(2)}→${currentRatio().toFixed(2)}`;
     };
 
@@ -639,17 +663,13 @@ function createAntiAliasing(folium, settings) {
         if (before !== currentRatio()) scheduleRatioChange();
         if (smooth2dEnabled || msaaEnabled) patchCanvasContexts();
         else unpatchCanvasContexts();
-        if (next.exportGuard) {
-            patchExportGuard();
-            if (suspended && !document.querySelector(EXPORT_GUARD_SELECTOR)) stopExport();
-        } else if (suspended) {
-            setSuspended(false, '');
-        }
+        guardEnabled = next.exportGuard;
+        if (guardEnabled) watchExportGuard();
+        else unwatchExportGuard();
     };
 
     const dispose = () => {
         const before = currentRatio();
-        if (suspended) setSuspended(false, '');
         while (undo.length) {
             const restore = undo.pop();
             try {
@@ -673,7 +693,8 @@ function createAntiAliasing(folium, settings) {
         restoreMatchMedia();
         restoreRatio();
         if (before !== currentRatio()) scheduleRatioChange();
-        guardPatched = false;
+        unwatchExportGuard();
+        guardEnabled = true;
         appliedMsaa = null;
         factor = 0;
     };
@@ -688,7 +709,7 @@ function createAntiAliasing(folium, settings) {
         scheduleRatioChange();
         const mode = effectiveMode();
         if (mode === 'off') return { message: '超采样与 MSAA 都关着，没有可应用的设置。' };
-        if (suspended) return { message: '宿主正在导出视频，导出结束后会自动恢复。' };
+        if (exportPaused()) return { message: '宿主正在导出视频，超采样暂时让出，导出结束后会自动恢复。' };
         return { message: `已应用并重载渲染：${modeLabel()}。画布已按新像素比重建；若几何边没变化，那是 MSAA 的上下文属性还没随新的 WebGL 上下文一起建起来——切一次歌词动画或重启即可。` };
     };
 
@@ -700,7 +721,7 @@ function createAntiAliasing(folium, settings) {
         const mode = effectiveMode();
         const parts = [
             `dpr 真实 ${real.toFixed(2)} → 生效 ${currentRatio().toFixed(2)}`,
-            `方式 ${modeLabel()}${suspended ? '（导出中已暂停）' : ''}`,
+            `方式 ${modeLabel()}${exportPaused() ? '（导出中已让出）' : ''}`,
             `开关 超采样${current.supersample ? '开' : '关'} / MSAA${current.msaa ? '开' : '关'} / 2D插值${current.smooth2d ? '开' : '关'}`,
         ];
         // 预算分两档，把当前档和实际像素数摊开：叠加后突然不够用时，这是唯一能看出原因的地方。
