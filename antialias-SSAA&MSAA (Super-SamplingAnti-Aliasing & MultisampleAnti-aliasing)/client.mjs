@@ -77,7 +77,7 @@ const COMBINED_PIXEL_BUDGET = 1920 * 1080 * 4;
 /** 同一个模组被重复加载时先收掉上一份补丁，避免两层 dpr 覆盖叠在一起。 */
 const INSTANCE_KEY = Symbol.for('folia.mod.antialias-ssaa-msaa');
 /** 与 mod.json 的 version 保持一致：启用时打进日志，一眼能看出加载的是哪份构建。 */
-const MOD_VERSION = '1.1.7';
+const MOD_VERSION = '1.1.9';
 /** 宿主视频导出期间插在 head 里的光标守卫（宿主实现细节，换了标记只是导出保护失效）。 */
 const EXPORT_GUARD_SELECTOR = 'style[data-folia-video-export-cursor-guard]';
 /** 设置变更后等多久再重建渲染：连点几个开关时只重建一次。 */
